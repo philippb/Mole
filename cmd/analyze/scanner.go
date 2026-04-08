@@ -61,6 +61,10 @@ func trySend[T any](ch chan<- T, item T, timeout time.Duration) bool {
 }
 
 func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) (scanResult, error) {
+	return scanPathConcurrentWithOptions(root, filesScanned, dirsScanned, bytesScanned, currentPath, true)
+}
+
+func scanPathConcurrentWithOptions(root string, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value, useSpotlight bool) (scanResult, error) {
 	children, err := os.ReadDir(root)
 	if err != nil {
 		return scanResult{}, err
@@ -69,6 +73,7 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 	var total int64
 	var localFilesScanned int64
 	var localBytesScanned int64
+	var subtreeFilesScanned atomic.Int64
 
 	// Keep Top N heaps.
 	entriesHeap := &entryHeap{}
@@ -173,19 +178,22 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 					defer wg.Done()
 					defer func() { <-sem }()
 
-					var size int64
+					result := scanResult{}
 					if cached, err := loadStoredOverviewSize(path); err == nil && cached > 0 {
-						size = cached
+						result.TotalSize = cached
 					} else {
-						size = scanSubdirWithCache(path, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)
+						result = scanSubdirWithCache(path, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)
 					}
-					atomic.AddInt64(&total, size)
+					atomic.AddInt64(&total, result.TotalSize)
+					if result.TotalFiles > 0 {
+						subtreeFilesScanned.Add(result.TotalFiles)
+					}
 					atomic.AddInt64(dirsScanned, 1)
 
 					trySend(entryChan, dirEntry{
 						Name:       name,
 						Path:       path,
-						Size:       size,
+						Size:       result.TotalSize,
 						IsDir:      true,
 						LastAccess: time.Time{},
 					}, 100*time.Millisecond)
@@ -229,14 +237,17 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				size := scanSubdirWithCache(path, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)
-				atomic.AddInt64(&total, size)
+				result := scanSubdirWithCache(path, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)
+				atomic.AddInt64(&total, result.TotalSize)
+				if result.TotalFiles > 0 {
+					subtreeFilesScanned.Add(result.TotalFiles)
+				}
 				atomic.AddInt64(dirsScanned, 1)
 
 				trySend(entryChan, dirEntry{
 					Name:       name,
 					Path:       path,
-					Size:       size,
+					Size:       result.TotalSize,
 					IsDir:      true,
 					LastAccess: time.Time{},
 				}, 100*time.Millisecond)
@@ -297,15 +308,17 @@ func scanPathConcurrent(root string, filesScanned, dirsScanned, bytesScanned *in
 	}
 
 	// Use Spotlight for large files when it expands the list.
-	if spotlightFiles := findLargeFilesWithSpotlight(root, spotlightMinFileSize); len(spotlightFiles) > len(largeFiles) {
-		largeFiles = spotlightFiles
+	if useSpotlight {
+		if spotlightFiles := findLargeFilesWithSpotlight(root, spotlightMinFileSize); len(spotlightFiles) > len(largeFiles) {
+			largeFiles = spotlightFiles
+		}
 	}
 
 	return scanResult{
 		Entries:    entries,
 		LargeFiles: largeFiles,
 		TotalSize:  total,
-		TotalFiles: atomic.LoadInt64(filesScanned),
+		TotalFiles: localFilesScanned + subtreeFilesScanned.Load(),
 	}, nil
 }
 
@@ -315,17 +328,10 @@ func publishLargeFiles(files []fileEntry, largeFileChan chan<- fileEntry) {
 	}
 }
 
-func loadCachedSubdirResult(path string, largeFileChan chan<- fileEntry, filesScanned, bytesScanned *int64) (scanResult, bool) {
+func loadCachedSubdirResult(path string, largeFileChan chan<- fileEntry) (scanResult, bool) {
 	cached, err := loadCacheFromDisk(path)
 	if err != nil {
 		return scanResult{}, false
-	}
-
-	if cached.TotalFiles > 0 {
-		atomic.AddInt64(filesScanned, cached.TotalFiles)
-	}
-	if cached.TotalSize > 0 {
-		atomic.AddInt64(bytesScanned, cached.TotalSize)
 	}
 
 	result := scanResult{
@@ -338,19 +344,25 @@ func loadCachedSubdirResult(path string, largeFileChan chan<- fileEntry, filesSc
 	return result, true
 }
 
-func scanSubdirWithCache(root string, largeFileChan chan<- fileEntry, largeFileMinSize *int64, dirSem, duSem, duQueueSem chan struct{}, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) int64 {
-	if cached, ok := loadCachedSubdirResult(root, largeFileChan, filesScanned, bytesScanned); ok {
-		return cached.TotalSize
+func scanSubdirWithCache(root string, largeFileChan chan<- fileEntry, largeFileMinSize *int64, dirSem, duSem, duQueueSem chan struct{}, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) scanResult {
+	if cached, ok := loadCachedSubdirResult(root, largeFileChan); ok {
+		if cached.TotalFiles > 0 {
+			atomic.AddInt64(filesScanned, cached.TotalFiles)
+		}
+		if cached.TotalSize > 0 {
+			atomic.AddInt64(bytesScanned, cached.TotalSize)
+		}
+		return cached
 	}
 
-	result, err := scanPathConcurrent(root, filesScanned, dirsScanned, bytesScanned, currentPath)
+	result, err := scanPathConcurrentWithOptions(root, filesScanned, dirsScanned, bytesScanned, currentPath, false)
 	if err == nil {
 		publishLargeFiles(result.LargeFiles, largeFileChan)
-		_ = saveCacheToDisk(root, result)
-		return result.TotalSize
+		_ = saveCacheToDiskWithOptions(root, result, true)
+		return result
 	}
 
-	return calculateDirSizeConcurrent(root, largeFileChan, largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)
+	return scanResult{TotalSize: calculateDirSizeConcurrent(root, largeFileChan, largeFileMinSize, dirSem, duSem, duQueueSem, filesScanned, dirsScanned, bytesScanned, currentPath)}
 }
 
 func shouldFoldDirWithPath(name, path string) bool {
