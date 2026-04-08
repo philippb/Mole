@@ -313,6 +313,107 @@ func TestCacheSaveLoadRoundTrip(t *testing.T) {
 	}
 }
 
+func TestScanPathConcurrentWarmsChildDirectoryCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := filepath.Join(home, "root")
+	child := filepath.Join(root, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "data.bin"), []byte(strings.Repeat("x", 4096)), 0o644); err != nil {
+		t.Fatalf("write child data: %v", err)
+	}
+
+	var filesScanned, dirsScanned, bytesScanned int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	if _, err := scanPathConcurrent(root, &filesScanned, &dirsScanned, &bytesScanned, current); err != nil {
+		t.Fatalf("scanPathConcurrent(root): %v", err)
+	}
+
+	cached, err := loadCacheFromDisk(child)
+	if err != nil {
+		t.Fatalf("expected warmed child cache, got error: %v", err)
+	}
+	if cached.TotalSize <= 0 {
+		t.Fatalf("expected positive cached child size, got %d", cached.TotalSize)
+	}
+	if len(cached.Entries) == 0 {
+		t.Fatalf("expected cached child entries to be populated")
+	}
+}
+
+func TestScanPathConcurrentUsesChildCacheLargeFiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := filepath.Join(home, "root")
+	child := filepath.Join(root, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	largeFile := filepath.Join(child, "large.bin")
+	if err := os.WriteFile(largeFile, []byte(strings.Repeat("x", 2<<20)), 0o644); err != nil {
+		t.Fatalf("write large file: %v", err)
+	}
+
+	var childFiles, childDirs, childBytes int64
+	childCurrent := &atomic.Value{}
+	childCurrent.Store("")
+	childResult, err := scanPathConcurrent(child, &childFiles, &childDirs, &childBytes, childCurrent)
+	if err != nil {
+		t.Fatalf("scanPathConcurrent(child): %v", err)
+	}
+	if err := saveCacheToDisk(child, childResult); err != nil {
+		t.Fatalf("saveCacheToDisk(child): %v", err)
+	}
+
+	if err := os.Chmod(child, 0o000); err != nil {
+		t.Fatalf("chmod child unreadable: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(child, 0o755)
+	}()
+
+	var filesScanned, dirsScanned, bytesScanned int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	result, err := scanPathConcurrent(root, &filesScanned, &dirsScanned, &bytesScanned, current)
+	if err != nil {
+		t.Fatalf("scanPathConcurrent(root): %v", err)
+	}
+
+	foundChild := false
+	for _, entry := range result.Entries {
+		if entry.Path == child {
+			foundChild = true
+			if entry.Size != childResult.TotalSize {
+				t.Fatalf("cached child size mismatch: want %d, got %d", childResult.TotalSize, entry.Size)
+			}
+			break
+		}
+	}
+	if !foundChild {
+		t.Fatalf("expected cached child directory in root entries")
+	}
+
+	foundLargeFile := false
+	for _, file := range result.LargeFiles {
+		if file.Path == largeFile {
+			foundLargeFile = true
+			break
+		}
+	}
+	if !foundLargeFile {
+		t.Fatalf("expected root large files to include cached child large file")
+	}
+}
+
 func TestMeasureOverviewSize(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
