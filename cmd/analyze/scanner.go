@@ -346,6 +346,9 @@ func loadCachedSubdirResult(path string, largeFileChan chan<- fileEntry) (scanRe
 
 func scanSubdirWithCache(root string, largeFileChan chan<- fileEntry, largeFileMinSize *int64, dirSem, duSem, duQueueSem chan struct{}, filesScanned, dirsScanned, bytesScanned *int64, currentPath *atomic.Value) scanResult {
 	if cached, ok := loadCachedSubdirResult(root, largeFileChan); ok {
+		// Parent scans only count direct files in their own directory. Cached subtree
+		// hits must advance the shared progress counters here so navigation progress
+		// matches the returned subtree totals without double-counting.
 		if cached.TotalFiles > 0 {
 			atomic.AddInt64(filesScanned, cached.TotalFiles)
 		}
@@ -355,6 +358,10 @@ func scanSubdirWithCache(root string, largeFileChan chan<- fileEntry, largeFileM
 		return cached
 	}
 
+	// Cache misses recurse through scanPathConcurrentWithOptions, which allocates a
+	// fresh worker pool per subtree. The shared dir/du semaphores are only reused by
+	// the size-only fallback below, where recursion falls back to synchronous work
+	// instead of blocking when those pools are saturated.
 	result, err := scanPathConcurrentWithOptions(root, filesScanned, dirsScanned, bytesScanned, currentPath, false)
 	if err == nil {
 		publishLargeFiles(result.LargeFiles, largeFileChan)

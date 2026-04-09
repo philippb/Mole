@@ -448,6 +448,75 @@ func TestScanPathConcurrentUsesChildCacheLargeFiles(t *testing.T) {
 	}
 }
 
+func TestScanPathConcurrentCountsCachedChildOnce(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := filepath.Join(home, "root")
+	child := filepath.Join(root, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	rootFile := filepath.Join(root, "root.txt")
+	if err := os.WriteFile(rootFile, []byte("root-data"), 0o644); err != nil {
+		t.Fatalf("write root file: %v", err)
+	}
+
+	childFile := filepath.Join(child, "child.bin")
+	childData := []byte(strings.Repeat("x", 4096))
+	if err := os.WriteFile(childFile, childData, 0o644); err != nil {
+		t.Fatalf("write child file: %v", err)
+	}
+
+	var childFiles, childDirs, childBytes int64
+	childCurrent := &atomic.Value{}
+	childCurrent.Store("")
+	childResult, err := scanPathConcurrent(child, &childFiles, &childDirs, &childBytes, childCurrent)
+	if err != nil {
+		t.Fatalf("scanPathConcurrent(child): %v", err)
+	}
+	if err := saveCacheToDisk(child, childResult); err != nil {
+		t.Fatalf("saveCacheToDisk(child): %v", err)
+	}
+
+	if err := os.Chmod(child, 0o000); err != nil {
+		t.Fatalf("chmod child unreadable: %v", err)
+	}
+	defer func() {
+		_ = os.Chmod(child, 0o755)
+	}()
+
+	rootInfo, err := os.Stat(rootFile)
+	if err != nil {
+		t.Fatalf("stat root file: %v", err)
+	}
+	expectedFiles := int64(1) + childResult.TotalFiles
+	expectedBytes := getActualFileSize(rootFile, rootInfo) + childResult.TotalSize
+
+	var filesScanned, dirsScanned, bytesScanned int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	result, err := scanPathConcurrent(root, &filesScanned, &dirsScanned, &bytesScanned, current)
+	if err != nil {
+		t.Fatalf("scanPathConcurrent(root): %v", err)
+	}
+
+	if got := atomic.LoadInt64(&filesScanned); got != expectedFiles {
+		t.Fatalf("expected cached child file count to be added once, want %d got %d", expectedFiles, got)
+	}
+	if got := atomic.LoadInt64(&bytesScanned); got != expectedBytes {
+		t.Fatalf("expected cached child bytes to be added once, want %d got %d", expectedBytes, got)
+	}
+	if result.TotalFiles != expectedFiles {
+		t.Fatalf("expected root result total files %d, got %d", expectedFiles, result.TotalFiles)
+	}
+	if result.TotalSize != expectedBytes {
+		t.Fatalf("expected root result total size %d, got %d", expectedBytes, result.TotalSize)
+	}
+}
+
 func TestScanPathConcurrentWarmsChildCachesWithoutRecursiveSpotlight(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -524,6 +593,40 @@ func TestScanCmdTreatsWarmedCacheAsStale(t *testing.T) {
 	}
 	if scanMsg.result.TotalFiles != result.TotalFiles {
 		t.Fatalf("expected cached result to survive stale load, got %d", scanMsg.result.TotalFiles)
+	}
+}
+
+func TestSaveCacheToDiskWithOptionsPersistsNeedsRefresh(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	target := filepath.Join(home, "target")
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatalf("create target: %v", err)
+	}
+
+	saved := scanResult{
+		Entries:    []dirEntry{{Name: "child", Path: filepath.Join(target, "child"), Size: 7, IsDir: true}},
+		LargeFiles: []fileEntry{{Name: "big.bin", Path: filepath.Join(target, "big.bin"), Size: 2 << 20}},
+		TotalSize:  42,
+		TotalFiles: 3,
+	}
+	if err := saveCacheToDiskWithOptions(target, saved, true); err != nil {
+		t.Fatalf("saveCacheToDiskWithOptions: %v", err)
+	}
+
+	loaded, err := loadStaleCacheFromDisk(target)
+	if err != nil {
+		t.Fatalf("loadStaleCacheFromDisk: %v", err)
+	}
+	if !loaded.NeedsRefresh {
+		t.Fatalf("expected persisted cache entry to keep NeedsRefresh=true")
+	}
+	if loaded.TotalFiles != saved.TotalFiles {
+		t.Fatalf("expected persisted total files %d, got %d", saved.TotalFiles, loaded.TotalFiles)
+	}
+	if loaded.TotalSize != saved.TotalSize {
+		t.Fatalf("expected persisted total size %d, got %d", saved.TotalSize, loaded.TotalSize)
 	}
 }
 
@@ -730,6 +833,101 @@ func TestScanPathConcurrentWarmsChildCacheWithLiveProgress(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatalf("scan did not complete")
+	}
+}
+
+func TestScanSubdirWithCacheMissIgnoresCallerSemaphores(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := filepath.Join(home, "root")
+	child := filepath.Join(root, "child")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(child, "data.bin"), []byte("payload"), 0o644); err != nil {
+		t.Fatalf("write child data: %v", err)
+	}
+
+	dirSem := make(chan struct{}, 1)
+	dirSem <- struct{}{}
+	duSem := make(chan struct{}, 1)
+	duSem <- struct{}{}
+	duQueueSem := make(chan struct{}, 1)
+	duQueueSem <- struct{}{}
+
+	largeFileChan := make(chan fileEntry, 8)
+	largeFileMinSize := int64(1)
+	var filesScanned, dirsScanned, bytesScanned int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	done := make(chan scanResult, 1)
+	go func() {
+		done <- scanSubdirWithCache(root, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, &filesScanned, &dirsScanned, &bytesScanned, current)
+	}()
+
+	var result scanResult
+	select {
+	case result = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("scanSubdirWithCache cache-miss path blocked on caller semaphores")
+	}
+
+	if result.TotalFiles != 1 {
+		t.Fatalf("expected nested scan to count 1 file, got %d", result.TotalFiles)
+	}
+	if atomic.LoadInt64(&filesScanned) != 1 {
+		t.Fatalf("expected shared progress to advance despite saturated caller semaphores")
+	}
+}
+
+func TestCalculateDirSizeConcurrentFallsBackWhenDirSemaphoreSaturated(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	root := filepath.Join(home, "root")
+	leaf := filepath.Join(root, "child", "grandchild")
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
+		t.Fatalf("create nested dirs: %v", err)
+	}
+	payload := []byte(strings.Repeat("x", 32))
+	filePath := filepath.Join(leaf, "data.bin")
+	if err := os.WriteFile(filePath, payload, 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+
+	dirSem := make(chan struct{}, 1)
+	dirSem <- struct{}{}
+	duSem := make(chan struct{}, 1)
+	duQueueSem := make(chan struct{}, 1)
+	largeFileChan := make(chan fileEntry, 4)
+	largeFileMinSize := int64(1)
+
+	var filesScanned, dirsScanned, bytesScanned int64
+	current := &atomic.Value{}
+	current.Store("")
+
+	done := make(chan int64, 1)
+	go func() {
+		done <- calculateDirSizeConcurrent(root, largeFileChan, &largeFileMinSize, dirSem, duSem, duQueueSem, &filesScanned, &dirsScanned, &bytesScanned, current)
+	}()
+
+	var size int64
+	select {
+	case size = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("calculateDirSizeConcurrent blocked instead of falling back to synchronous recursion")
+	}
+
+	if size <= 0 {
+		t.Fatalf("expected positive size, got %d", size)
+	}
+	if atomic.LoadInt64(&filesScanned) != 1 {
+		t.Fatalf("expected fallback path to count nested file, got %d", atomic.LoadInt64(&filesScanned))
+	}
+	if atomic.LoadInt64(&dirsScanned) != 2 {
+		t.Fatalf("expected fallback path to count nested directories, got %d", atomic.LoadInt64(&dirsScanned))
 	}
 }
 

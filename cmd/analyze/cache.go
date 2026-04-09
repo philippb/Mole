@@ -293,12 +293,16 @@ func saveCacheToDiskWithOptions(path string, result scanResult, needsRefresh boo
 	}
 
 	entry := cacheEntry{
-		Entries:      result.Entries,
-		LargeFiles:   result.LargeFiles,
-		TotalSize:    result.TotalSize,
-		TotalFiles:   result.TotalFiles,
-		ModTime:      info.ModTime(),
-		ScanTime:     time.Now(),
+		Entries:    result.Entries,
+		LargeFiles: result.LargeFiles,
+		TotalSize:  result.TotalSize,
+		TotalFiles: result.TotalFiles,
+		ModTime:    info.ModTime(),
+		ScanTime:   time.Now(),
+		// Warmed child caches are intentionally persisted as NeedsRefresh=true so a
+		// later navigation can render cached content immediately and still force a
+		// full rescan. If the process exits first, the next launch preserves that
+		// "show stale now, refresh on open" behavior.
 		NeedsRefresh: needsRefresh,
 	}
 
